@@ -19,11 +19,12 @@ POLL_SECONDS = float(os.getenv("V3_POLL_SECONDS", "5"))
 LOOKBACK = int(os.getenv("V3_LOOKBACK", "60"))
 REQUIRE_TODAY = os.getenv("V3_REQUIRE_TODAY", "true").lower() == "true"
 MAX_AGE = max(120.0, float(os.getenv("V3_MAX_CANDLE_AGE_SECONDS", "120")))
-
 ADAPTER = DhanLiveDataAdapter()
+STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 STATE: dict[str, Any] = {
     "status": "starting",
+    "started_at": STARTED_AT,
     "updated_at": None,
     "source": "DHAN",
     "instrument": os.getenv("V3_DHAN_SYMBOL", "NIFTY"),
@@ -40,6 +41,7 @@ STATE: dict[str, Any] = {
     "location": None,
     "error": None,
     "candles": 0,
+    "evaluation_count": 0,
 }
 LOCK = threading.Lock()
 
@@ -58,7 +60,7 @@ def _serialize(value: Any) -> Any:
 
 def _safe_error(exc: Exception) -> str:
     text = str(exc)
-    for secret in (ADAPTER.client_id, ADAPTER.access_token):
+    for secret in (getattr(ADAPTER, "client_id", ""), getattr(ADAPTER, "access_token", "")):
         if secret:
             text = text.replace(secret, "***")
     return text
@@ -98,6 +100,7 @@ def evaluate() -> None:
             "location": _serialize(location_result),
             "error": None,
             "candles": len(series),
+            "evaluation_count": STATE["evaluation_count"] + 1,
         })
 
 
@@ -119,14 +122,33 @@ def worker() -> None:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
-        if self.path not in {"/", "/health", "/signal", "/state"}:
+        if self.path == "/probe":
+            with LOCK:
+                payload = {
+                    "service": "pullback-detector-v3",
+                    "reachable": True,
+                    "status": STATE["status"],
+                    "started_at": STATE["started_at"],
+                    "updated_at": STATE["updated_at"],
+                    "dhan_auth": STATE["dhan_auth"],
+                    "data_received": STATE["data_received"],
+                    "last_candle": STATE["last_candle"],
+                    "candle_age_seconds": STATE["candle_age_seconds"],
+                    "pipeline_status": STATE["pipeline_status"],
+                    "evaluation_count": STATE["evaluation_count"],
+                    "error": STATE["error"],
+                }
+            body = json.dumps(payload, default=str).encode()
+        elif self.path in {"/", "/health", "/signal", "/state"}:
+            with LOCK:
+                body = json.dumps(STATE, default=str).encode()
+        else:
             self.send_response(404)
             self.end_headers()
             return
-        with LOCK:
-            body = json.dumps(STATE, default=str).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
