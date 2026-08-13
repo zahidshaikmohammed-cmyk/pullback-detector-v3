@@ -5,76 +5,39 @@ import os
 import threading
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from zoneinfo import ZoneInfo
 
-import requests
-
+from .dhan_live_adapter import DhanLiveDataAdapter, DhanLiveDataError
 from .location_engine import classify_location
-from .market_data_ingestion import Candle, MarketDataIngestion
 from .pipeline_orchestrator import run_pipeline
 
 
+IST = ZoneInfo("Asia/Kolkata")
 POLL_SECONDS = float(os.getenv("V3_POLL_SECONDS", "5"))
 LOOKBACK = int(os.getenv("V3_LOOKBACK", "60"))
-LIVE_MARKET_URL = os.getenv("V3_LIVE_MARKET_URL", "https://psycho-market-bridge.onrender.com/market-live.json")
+REQUIRE_TODAY = os.getenv("V3_REQUIRE_TODAY", "true").lower() == "true"
+
+ADAPTER = DhanLiveDataAdapter()
 
 STATE: dict[str, Any] = {
     "status": "starting",
     "updated_at": None,
-    "source": LIVE_MARKET_URL,
+    "source": "DHAN",
+    "instrument": os.getenv("V3_DHAN_SYMBOL", "NIFTY"),
+    "security_id": os.getenv("V3_DHAN_SECURITY_ID", "13"),
+    "interval": os.getenv("V3_DHAN_INTERVAL", "1"),
     "signal": None,
     "entry": None,
     "regime": None,
     "location": None,
     "error": None,
     "candles": 0,
+    "latest_candle": None,
 }
 LOCK = threading.Lock()
-
-
-def _parse_timestamp(value: Any) -> datetime:
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value)
-    text = str(value).replace("Z", "+00:00")
-    return datetime.fromisoformat(text)
-
-
-def _extract_rows(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if not isinstance(payload, dict):
-        return []
-    for key in ("candles", "data", "market_data", "bars"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return [x for x in value if isinstance(x, dict)]
-    return []
-
-
-def _to_candles(payload: Any) -> list[Candle]:
-    rows = _extract_rows(payload)
-    candles: list[Candle] = []
-    for row in rows:
-        try:
-            instrument = row.get("instrument") or row.get("symbol") or row.get("security") or "NIFTY"
-            timestamp = row.get("timestamp") or row.get("time") or row.get("datetime")
-            candles.append(
-                Candle(
-                    str(instrument),
-                    _parse_timestamp(timestamp),
-                    float(row["open"]),
-                    float(row["high"]),
-                    float(row["low"]),
-                    float(row["close"]),
-                    float(row.get("volume", 0)),
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    candles.sort(key=lambda c: (c.instrument, c.timestamp))
-    return candles
 
 
 def _serialize(value: Any) -> Any:
@@ -90,33 +53,39 @@ def _serialize(value: Any) -> Any:
 
 
 def evaluate() -> None:
-    response = requests.get(LIVE_MARKET_URL, timeout=10)
-    response.raise_for_status()
-    candles = _to_candles(response.json())
+    candles = ADAPTER.fetch_today() if REQUIRE_TODAY else ADAPTER.fetch_candles()
     if not candles:
-        raise RuntimeError("live feed returned no valid candles")
+        raise DhanLiveDataError("Dhan returned no current-session candles")
 
     latest_instrument = candles[-1].instrument
     series = [c for c in candles if c.instrument == latest_instrument][-LOOKBACK:]
     if len(series) < 12:
-        raise RuntimeError(f"insufficient candles: {len(series)} < 12")
+        raise DhanLiveDataError(f"insufficient current-session candles: {len(series)} < 12")
+
+    latest = series[-1]
+    now_ist = datetime.now(IST)
+    age_seconds = (now_ist - latest.timestamp.astimezone(IST)).total_seconds()
+    max_age = max(120.0, float(os.getenv("V3_MAX_CANDLE_AGE_SECONDS", "120")))
+    if age_seconds > max_age:
+        raise DhanLiveDataError(f"stale Dhan candle: {int(age_seconds)}s old")
 
     range_low = min(c.low for c in series)
     range_high = max(c.high for c in series)
-    location_result = classify_location(series[-1].close, range_low, range_high)
+    location_result = classify_location(latest.close, range_low, range_high)
     result = run_pipeline(series, location_result.location)
 
     with LOCK:
         STATE.update(
             {
                 "status": "live",
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
                 "signal": _serialize(result.signal),
                 "entry": _serialize(result.entry),
                 "regime": _serialize(result.regime),
                 "location": _serialize(location_result),
                 "error": None,
                 "candles": len(series),
+                "latest_candle": _serialize(latest),
             }
         )
 
@@ -127,7 +96,13 @@ def worker() -> None:
             evaluate()
         except Exception as exc:
             with LOCK:
-                STATE.update({"status": "error", "error": str(exc), "updated_at": datetime.utcnow().isoformat() + "Z"})
+                STATE.update(
+                    {
+                        "status": "waiting",
+                        "error": str(exc),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
         time.sleep(POLL_SECONDS)
 
 
@@ -138,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         with LOCK:
-            body = json.dumps(STATE).encode()
+            body = json.dumps(STATE, default=str).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
