@@ -1,0 +1,67 @@
+version: "V3-CONFIG-001"
+mode: shadow
+
+session:
+  timezone: Asia/Kolkata
+  market_open: "09:15"
+  market_close: "15:30"
+  signal_cutoff: "15:15"
+
+data:
+  primary_timeframe: "5m"
+  require_complete_candle: true
+  max_tick_age_seconds: 5
+  reject_future_timestamps: true
+  reject_duplicate_events: true
+  fail_closed: true
+
+regime:
+  enabled: true
+  allowed:
+    - sideways
+    - transitional
+  minimum_evidence: 1
+
+location:
+  allow_mid_range: false
+  boundary_tolerance_atr: 0.15
+
+anatomy:
+  enabled:
+    - failed_auction
+    - sweep_reclaim
+    - breakout_retest
+    - compression_expansion
+  max_active_per_instrument: 4
+
+confirmation:
+  require_structure_intact: true
+  require_retest: true
+  require_response: true
+  require_displacement: true
+
+signal:
+  duplicate_suppression: true
+  max_signal_per_anatomy: 1
+  stale_after_seconds: 120
+
+entry:
+  models:
+    - retest
+    - displacement
+    - reclaim
+  reject_extended_entry: true
+
+risk:
+  enabled: true
+  require_valid_invalidation: true
+  minimum_reward_risk: 1.5
+
+replay:
+  chronological_only: true
+  forbid_lookahead: true
+
+observability:
+  audit_all_decisions: true
+  log_rejections: true
+  expose_data_health: true
