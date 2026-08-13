@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,8 @@ from .market_data_ingestion import Candle
 
 DHAN_INTRADAY_URL = "https://api.dhan.co/v2/charts/intraday"
 IST = ZoneInfo("Asia/Kolkata")
+SESSION_OPEN = dt_time(9, 15)
+SESSION_CLOSE = dt_time(15, 30)
 
 
 class DhanLiveDataError(RuntimeError):
@@ -19,7 +21,7 @@ class DhanLiveDataError(RuntimeError):
 
 
 class DhanLiveDataAdapter:
-    """Read fresh intraday candles directly from DhanHQ using server-side credentials."""
+    """Read and validate intraday candles directly from DhanHQ."""
 
     def __init__(
         self,
@@ -108,9 +110,13 @@ class DhanLiveDataAdapter:
 
         size = min(map(len, arrays))
         candles: list[Candle] = []
+        rejected_out_of_session = 0
         for index in range(size):
             try:
                 timestamp = self._timestamp(timestamps[index])
+                if not self._is_valid_session_timestamp(timestamp):
+                    rejected_out_of_session += 1
+                    continue
                 candle = Candle(
                     instrument=self._instrument_name(),
                     timestamp=timestamp,
@@ -126,8 +132,19 @@ class DhanLiveDataAdapter:
 
         candles.sort(key=lambda candle: candle.timestamp)
         if not candles:
+            if rejected_out_of_session:
+                raise DhanLiveDataError(
+                    f"Dhan returned {rejected_out_of_session} candles but none were within NSE session 09:15-15:30 IST"
+                )
             raise DhanLiveDataError("Dhan returned no valid candles")
         return candles
+
+    @staticmethod
+    def _is_valid_session_timestamp(timestamp: datetime) -> bool:
+        local = timestamp.astimezone(IST)
+        if local.weekday() >= 5:
+            return False
+        return SESSION_OPEN <= local.time().replace(tzinfo=None) <= SESSION_CLOSE
 
     def _timestamp(self, value: Any) -> datetime:
         if isinstance(value, (int, float)):
