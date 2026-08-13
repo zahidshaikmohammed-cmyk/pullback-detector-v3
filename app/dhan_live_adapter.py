@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -19,11 +19,7 @@ class DhanLiveDataError(RuntimeError):
 
 
 class DhanLiveDataAdapter:
-    """Read fresh intraday candles directly from DhanHQ using server-side credentials.
-
-    Credentials are read only from environment variables and are never included in
-    returned objects or exception messages.
-    """
+    """Read fresh intraday candles directly from DhanHQ using server-side credentials."""
 
     def __init__(
         self,
@@ -46,7 +42,7 @@ class DhanLiveDataAdapter:
         if not self.client_id or not self.access_token:
             raise DhanLiveDataError("DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN are required")
         if self.interval not in {"1", "5", "15", "25", "60"}:
-            raise DhanLiveDataError("V3_DHAN_INTERVAL must be one of 1, 5, 15, 25, 60")
+            raise DhanLiveDataError("interval V3_DHAN_INTERVAL must be one of 1, 5, 15, 25, 60")
 
     def fetch_candles(self, lookback_days: int = 5) -> list[Candle]:
         if lookback_days < 1 or lookback_days > 90:
