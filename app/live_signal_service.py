@@ -14,11 +14,11 @@ from .dhan_live_adapter import DhanLiveDataAdapter, DhanLiveDataError
 from .location_engine import classify_location
 from .pipeline_orchestrator import run_pipeline
 
-
 IST = ZoneInfo("Asia/Kolkata")
 POLL_SECONDS = float(os.getenv("V3_POLL_SECONDS", "5"))
 LOOKBACK = int(os.getenv("V3_LOOKBACK", "60"))
 REQUIRE_TODAY = os.getenv("V3_REQUIRE_TODAY", "true").lower() == "true"
+MAX_AGE = max(120.0, float(os.getenv("V3_MAX_CANDLE_AGE_SECONDS", "120")))
 
 ADAPTER = DhanLiveDataAdapter()
 
@@ -29,13 +29,17 @@ STATE: dict[str, Any] = {
     "instrument": os.getenv("V3_DHAN_SYMBOL", "NIFTY"),
     "security_id": os.getenv("V3_DHAN_SECURITY_ID", "13"),
     "interval": os.getenv("V3_DHAN_INTERVAL", "1"),
+    "dhan_auth": "configured",
+    "data_received": False,
+    "last_candle": None,
+    "candle_age_seconds": None,
+    "pipeline_status": "not_evaluated",
     "signal": None,
     "entry": None,
     "regime": None,
     "location": None,
     "error": None,
     "candles": 0,
-    "latest_candle": None,
 }
 LOCK = threading.Lock()
 
@@ -52,6 +56,14 @@ def _serialize(value: Any) -> Any:
     return value
 
 
+def _safe_error(exc: Exception) -> str:
+    text = str(exc)
+    for secret in (ADAPTER.client_id, ADAPTER.access_token):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 def evaluate() -> None:
     candles = ADAPTER.fetch_today() if REQUIRE_TODAY else ADAPTER.fetch_candles()
     if not candles:
@@ -63,10 +75,8 @@ def evaluate() -> None:
         raise DhanLiveDataError(f"insufficient current-session candles: {len(series)} < 12")
 
     latest = series[-1]
-    now_ist = datetime.now(IST)
-    age_seconds = (now_ist - latest.timestamp.astimezone(IST)).total_seconds()
-    max_age = max(120.0, float(os.getenv("V3_MAX_CANDLE_AGE_SECONDS", "120")))
-    if age_seconds > max_age:
+    age_seconds = (datetime.now(IST) - latest.timestamp.astimezone(IST)).total_seconds()
+    if age_seconds > MAX_AGE:
         raise DhanLiveDataError(f"stale Dhan candle: {int(age_seconds)}s old")
 
     range_low = min(c.low for c in series)
@@ -75,19 +85,20 @@ def evaluate() -> None:
     result = run_pipeline(series, location_result.location)
 
     with LOCK:
-        STATE.update(
-            {
-                "status": "live",
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "signal": _serialize(result.signal),
-                "entry": _serialize(result.entry),
-                "regime": _serialize(result.regime),
-                "location": _serialize(location_result),
-                "error": None,
-                "candles": len(series),
-                "latest_candle": _serialize(latest),
-            }
-        )
+        STATE.update({
+            "status": "live",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "data_received": True,
+            "last_candle": latest.timestamp.isoformat(),
+            "candle_age_seconds": round(max(0.0, age_seconds), 2),
+            "pipeline_status": "evaluated",
+            "signal": _serialize(result.signal),
+            "entry": _serialize(result.entry),
+            "regime": _serialize(result.regime),
+            "location": _serialize(location_result),
+            "error": None,
+            "candles": len(series),
+        })
 
 
 def worker() -> None:
@@ -96,13 +107,13 @@ def worker() -> None:
             evaluate()
         except Exception as exc:
             with LOCK:
-                STATE.update(
-                    {
-                        "status": "waiting",
-                        "error": str(exc),
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+                STATE.update({
+                    "status": "waiting",
+                    "data_received": False,
+                    "pipeline_status": "blocked",
+                    "error": _safe_error(exc),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
         time.sleep(POLL_SECONDS)
 
 
